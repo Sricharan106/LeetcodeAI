@@ -128,32 +128,8 @@
     // Observer for automagic trigger on successful submission
     const observer = new MutationObserver(async (mutations) => {
         const resultElement = document.querySelector('[data-e2e-locator="submission-result"]');
-        if (resultElement && resultElement.innerText && resultElement.innerText.trim().toLowerCase() === 'accepted') {
-            // Debounce rapid DOM mutations that happen on submission
-            if (autoTriggerTimer) clearTimeout(autoTriggerTimer);
-            autoTriggerTimer = setTimeout(async () => {
-                try {
-                    const key = _computeProblemKey();
-                    const stored = await chrome.storage.local.get(['lastAutoTrigger', 'geminiKey']);
-                    const last = stored.lastAutoTrigger || {};
-
-                    const now = Date.now();
-                    if (key && last.hash === key && (now - (last.ts || 0)) < AUTO_TRIGGER_MIN_INTERVAL_MS) {
-                        // Duplicate within short interval — ignore
-                        return;
-                    }
-
-                    // Optionally ensure the user has configured a key before auto-posting
-                    // If no geminiKey is present, skip auto-trigger
-                    if (!stored.geminiKey) return;
-
-                    // Record this trigger and run
-                    await chrome.storage.local.set({ lastAutoTrigger: { hash: key, ts: now } });
-                    triggerBlogGeneration();
-                } catch (err) {
-                    console.error('Auto-trigger error:', err);
-                }
-            }, AUTO_TRIGGER_DEBOUNCE_MS);
+        if (resultElement && resultElement.innerText.trim() === 'Accepted') {
+            triggerBlogGeneration();
         }
     });
 
