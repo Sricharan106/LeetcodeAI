@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+import requests
 from datetime import datetime
 
 import numpy as np
@@ -228,31 +229,6 @@ def _clean_response(text: str) -> str:
 
 
 def generate_blog(problem) -> str:
-    """
-    Generates a beginner-friendly technical blog post
-    for a LeetCode problem using Gemini AI.
-
-    Features:
-    - Uses fallback Gemini models if quota is exceeded
-    - Retries automatically on temporary rate-limit errors
-    - Cleans AI-generated markdown responses
-    - Handles invalid or leaked API keys gracefully
-
-    Args:
-        problem: Object containing LeetCode problem details.
-
-    Returns:
-        str: Generated markdown blog content.
-
-    Raises:
-        Exception: If all Gemini models fail or API configuration is invalid.
-    """
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise Exception("GEMINI_API_KEY is not set. Add it to backend/.env")
-
-    client = genai.Client(api_key=api_key)
-
     current_time = (
         problem.client_time
         if hasattr(problem, "client_time") and problem.client_time
@@ -260,92 +236,69 @@ def generate_blog(problem) -> str:
     )
     prompt = _build_prompt(problem, current_time)
 
-    last_error = None
-
-    for model_name in MODEL_FALLBACK_CHAIN:
-        logger.info("Trying model: %s", model_name)
-
-        for attempt in range(1, MAX_RETRIES + 1):
+    # 1. Try Gemini
+    api_key = os.getenv("GEMINI_API_KEY")
+    if api_key:
+        client = genai.Client(api_key=api_key)
+        for model_name in MODEL_FALLBACK_CHAIN:
+            logger.info("Trying Gemini model: %s", model_name)
             try:
                 response = client.models.generate_content(
                     model=model_name, 
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         safety_settings=[
-                            types.SafetySetting(
-                                category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                                threshold=types.HarmBlockThreshold.BLOCK_NONE,
-                            ),
-                            types.SafetySetting(
-                                category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-                                threshold=types.HarmBlockThreshold.BLOCK_NONE,
-                            ),
-                            types.SafetySetting(
-                                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                                threshold=types.HarmBlockThreshold.BLOCK_NONE,
-                            ),
-                            types.SafetySetting(
-                                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                                threshold=types.HarmBlockThreshold.BLOCK_NONE,
-                            ),
+                            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+                            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+                            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+                            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
                         ]
                     )
                 )
-
                 if not response.text:
-                    reason = "Unknown"
-                    if getattr(response, "candidates", None) and len(response.candidates) > 0:
-                        reason = getattr(response.candidates[0], "finish_reason", "No finish_reason")
-                    raise Exception(f"Received empty response from Gemini API. Finish reason: {reason}")
-
+                    reason = getattr(response.candidates[0], "finish_reason", "Unknown") if getattr(response, "candidates", None) else "Unknown"
+                    logger.warning("Empty response from Gemini. Reason: %s", reason)
+                    continue # Try next model
                 return _clean_response(response.text)
-
             except Exception as e:
-                error_str = str(e)
+                logger.warning("Gemini model %s failed: %s", model_name, str(e))
+                # Do NOT sleep! Immediately fallback to other models so the frontend doesn't timeout!
+                continue
 
-                # --- Leaked / invalid key: no point retrying ---
-                if "403" in error_str and (
-                    "leaked" in error_str.lower() or "invalid" in error_str.lower()
-                ):
-                    raise Exception(
-                        "Your Gemini API key is invalid or has been reported as leaked. "
-                        "Please generate a new key at https://aistudio.google.com/app/apikey "
-                        "and update the GEMINI_API_KEY in your backend/.env file."
-                    )
+    # 2. Try Groq (Llama 3 8B or 70B)
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    if groq_api_key:
+        logger.info("Trying Groq (llama3-8b-8192)")
+        try:
+            res = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {groq_api_key}", "Content-Type": "application/json"},
+                json={"model": "llama3-8b-8192", "messages": [{"role": "user", "content": prompt}]}
+            )
+            if res.ok:
+                return _clean_response(res.json()["choices"][0]["message"]["content"])
+            else:
+                logger.warning("Groq failed: %s", res.text)
+        except Exception as e:
+            logger.warning("Groq exception: %s", str(e))
 
-                # --- Rate limited: wait and retry ---
-                if (
-                    "429" in error_str
-                    or "quota" in error_str.lower()
-                    or "rate" in error_str.lower()
-                ):
-                    if attempt < MAX_RETRIES:
-                        wait = INITIAL_BACKOFF_SECONDS * attempt
-                        logger.warning(
-                            "Rate limited on %s (attempt %d/%d). Retrying in %ds...",
-                            model_name,
-                            attempt,
-                            MAX_RETRIES,
-                            wait,
-                        )
-                        time.sleep(wait)
-                        continue
-                    else:
-                        # Exhausted retries on this model, try the next one
-                        logger.warning(
-                            "Quota exhausted on %s. Falling back to next model.",
-                            model_name,
-                        )
-                        last_error = Exception(
-                            f"Rate limit hit on {model_name} after {MAX_RETRIES} retries. "
-                            "Please wait a minute and try again, or upgrade your Gemini API plan."
-                        )
-                        break  # break retry loop → next model
+    # 3. Try xAI Grok
+    grok_api_key = os.getenv("XAI_API_KEY")
+    if grok_api_key:
+        logger.info("Trying Grok (grok-beta)")
+        try:
+            res = requests.post(
+                "https://api.x.ai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {grok_api_key}", "Content-Type": "application/json"},
+                json={"model": "grok-beta", "messages": [{"role": "user", "content": prompt}]}
+            )
+            if res.ok:
+                return _clean_response(res.json()["choices"][0]["message"]["content"])
+            else:
+                logger.warning("Grok failed: %s", res.text)
+        except Exception as e:
+            logger.warning("Grok exception: %s", str(e))
 
-                # --- Any other unexpected error ---
-                raise Exception(f"Gemini API error: {error_str}")
+    # All models failed
+    raise Exception("All LLM providers (Gemini, Groq, Grok) are rate-limited or unavailable. Please wait a moment and try again, or check your API keys.")
 
-    # All models exhausted
-    raise last_error or Exception(
-        "All Gemini models are currently quota-limited. Please wait a minute and try again."
-    )
